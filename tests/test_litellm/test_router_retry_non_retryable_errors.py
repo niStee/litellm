@@ -16,6 +16,7 @@ import pytest
 
 import litellm
 from litellm import Router
+from litellm.router_utils.cooldown_handlers import _async_get_cooldown_deployments
 from litellm.router_utils.get_retry_from_policy import get_num_retries_from_retry_policy
 from litellm.types.router import RetryPolicy
 
@@ -300,6 +301,51 @@ async def test_terminal_quota_during_retries_overrides_rate_limit_policy(policy_
 
     assert upstream.await_count == (quota_attempt or 4)
     assert exc_info.value is failures[(quota_attempt or 4) - 1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy_scope", ["global", "model_group"])
+async def test_quota_on_retry_cools_down_the_failed_deployment(policy_scope: str):
+    deployment_id = "quota-primary"
+    policy = RetryPolicy(RateLimitErrorRetries=3)
+    router = Router(
+        model_list=[
+            {
+                "model_name": "test-model",
+                "litellm_params": {"model": "openai/gpt-5.5", "api_key": "fake-key"},
+                "model_info": {"id": deployment_id},
+            },
+            {
+                "model_name": "test-model",
+                "litellm_params": {"model": "openai/gpt-5.5", "api_key": "fake-key"},
+                "model_info": {"id": "quota-peer"},
+            },
+        ],
+        num_retries=3,
+        retry_after=0,
+        cooldown_time=60,
+        allowed_fails_policy={"RateLimitErrorAllowedFails": 3},
+        retry_policy=policy if policy_scope == "global" else None,
+        model_group_retry_policy={"test-model": policy} if policy_scope == "model_group" else None,
+    )
+    quota_error = _make_insufficient_quota_error()
+    quota_error.failed_deployment_id = deployment_id
+    upstream = AsyncMock(side_effect=[_make_rate_limit_error(), quota_error])
+
+    with pytest.raises(litellm.InsufficientQuotaError):
+        await router.async_function_with_retries(
+            model="test-model",
+            messages=[{"role": "user", "content": "test"}],
+            original_function=upstream,
+            metadata={},
+        )
+
+    cooldown_ids = await _async_get_cooldown_deployments(
+        litellm_router_instance=router,
+        parent_otel_span=None,
+    )
+    assert deployment_id in cooldown_ids
+    assert "quota-peer" not in cooldown_ids
 
 
 @pytest.mark.asyncio
