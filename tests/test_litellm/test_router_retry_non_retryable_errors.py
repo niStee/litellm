@@ -268,6 +268,41 @@ def test_insufficient_quota_error_ignores_rate_limit_retry_policy():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("policy_scope", ["global", "model_group"])
+@pytest.mark.parametrize("quota_attempt", [1, 2, 3, None])
+async def test_terminal_quota_during_retries_overrides_rate_limit_policy(policy_scope: str, quota_attempt: int | None):
+    policy = RetryPolicy(RateLimitErrorRetries=3)
+    router = Router(
+        model_list=[
+            {"model_name": "test-model", "litellm_params": {"model": "openai/gpt-5.5", "api_key": key}}
+            for key in ("fake-key-1", "fake-key-2")
+        ],
+        num_retries=3,
+        retry_after=0,
+        retry_policy=policy if policy_scope == "global" else None,
+        model_group_retry_policy={"test-model": policy} if policy_scope == "model_group" else None,
+    )
+    quota_error = _make_insufficient_quota_error()
+    failures = tuple(
+        quota_error if quota_attempt is not None and attempt >= quota_attempt else _make_rate_limit_error()
+        for attempt in range(1, 5)
+    )
+    upstream = AsyncMock(side_effect=failures)
+    expected_exception = litellm.InsufficientQuotaError if quota_attempt is not None else litellm.RateLimitError
+
+    with pytest.raises(expected_exception) as exc_info:
+        await router.async_function_with_retries(
+            model="test-model",
+            messages=[{"role": "user", "content": "test"}],
+            original_function=upstream,
+            metadata={},
+        )
+
+    assert upstream.await_count == (quota_attempt or 4)
+    assert exc_info.value is failures[(quota_attempt or 4) - 1]
+
+
+@pytest.mark.asyncio
 async def test_not_found_error_in_retry_loop_raises_immediately():
     """
     A 404 NotFoundError inside the retry loop should break out immediately.
