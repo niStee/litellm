@@ -6035,6 +6035,12 @@ class Router:
             e,
             (litellm.ContextWindowExceededError, litellm.ContentPolicyViolationError),
         )
+        # Order and external fallbacks are already sequenced by the parent
+        # run_async_fallback call. A failed order target must return to that
+        # loop instead of recursively consuming later targets and fallbacks.
+        if kwargs.get("_target_order") is not None and not _skip_order_fallback:
+            raise e
+
         _request_team_id: Optional[str] = (kwargs.get("metadata", {}) or {}).get("user_api_key_team_id")
         # Use wildcard-aware lookup so order-based fallback also works for model
         # groups resolved via pattern routing (e.g. `openai/*` -> `openai/gpt-4.1-mini`).
@@ -6348,6 +6354,45 @@ class Router:
                     Context_Policy_Fallbacks={content_policy_fallbacks}",
             )
 
+    async def _ensure_quota_deployment_cooldown(self, exception: Exception) -> None:
+        """Ensure a terminal quota error cools down the deployment that returned it."""
+        if self.disable_cooldowns:
+            return
+
+        if getattr(exception, "_router_quota_cooldown_registered", False):
+            return
+
+        deployment_id = getattr(exception, "failed_deployment_id", None)
+        if not deployment_id:
+            return
+
+        deployment = self.get_deployment(model_id=deployment_id)
+        if deployment is None:
+            return
+
+        deployment_litellm_params = getattr(deployment, "litellm_params", None)
+        if not isinstance(deployment_litellm_params, LiteLLM_Params):
+            return
+        raw_deployment_cooldown = getattr(deployment_litellm_params, "cooldown_time", None)
+        deployment_cooldown: Optional[float] = None
+        if isinstance(raw_deployment_cooldown, (int, float)):
+            deployment_cooldown = float(raw_deployment_cooldown)
+        cooldown_time = self._get_cooldown_time_for_exception(
+            exception=exception,
+            deployment_cooldown=deployment_cooldown,
+        )
+
+        if cooldown_time <= 0:
+            return
+
+        _set_cooldown_deployments(
+            litellm_router_instance=self,
+            original_exception=exception,
+            exception_status=getattr(exception, "status_code", ""),
+            deployment=deployment_id,
+            time_to_cooldown=cooldown_time,
+        )
+
     @tracer.wrap()
     async def async_function_with_retries(self, *args, **kwargs):
         verbose_router_logger.debug("Inside async function with retries.")
@@ -6385,6 +6430,9 @@ class Router:
             response = add_retry_headers_to_response(response=response, attempted_retries=0, max_retries=None)
             return response
         except Exception as e:
+            if isinstance(e, litellm.InsufficientQuotaError):
+                await self._ensure_quota_deployment_cooldown(exception=e)
+
             current_attempt = None
             original_exception = e
             deployment_num_retries = getattr(e, "num_retries", None)
@@ -6472,6 +6520,7 @@ class Router:
 
                 except Exception as e:
                     if isinstance(e, litellm.InsufficientQuotaError):
+                        await self._ensure_quota_deployment_cooldown(exception=e)
                         raise
 
                     # Always track the latest error so we raise the most
@@ -6918,30 +6967,12 @@ class Router:
             litellm_params = kwargs.get("litellm_params", {})
             _model_info = litellm_params.get("model_info", {})
 
-            exception_headers = litellm.litellm_core_utils.exception_mapping_utils._get_response_headers(
-                original_exception=exception
-            )
-
             # Determine cooldown time with priority: deployment config > response header > router default
             deployment_cooldown = litellm_params.get("cooldown_time", None)
-
-            header_cooldown = None
-            if exception_headers is not None:
-                header_cooldown = litellm.utils._get_retry_after_from_exception_header(
-                    response_headers=exception_headers
-                )
-            ##############################################
-            # Logic to determine cooldown time
-            # 1. Check if a cooldown time is set in the deployment config
-            # 2. Check if a cooldown time is set in the response header
-            # 3. If no cooldown time is set, use the router default cooldown time
-            ##############################################
-            if deployment_cooldown is not None and deployment_cooldown >= 0:
-                _time_to_cooldown = deployment_cooldown
-            elif header_cooldown is not None and header_cooldown >= 0:
-                _time_to_cooldown = header_cooldown
-            else:
-                _time_to_cooldown = self.cooldown_time
+            _time_to_cooldown = self._get_cooldown_time_for_exception(
+                exception=exception,
+                deployment_cooldown=deployment_cooldown,
+            )
 
             if isinstance(_model_info, dict):
                 deployment_id: Optional[str] = _model_info.get("id")
@@ -6959,6 +6990,9 @@ class Router:
                     time_to_cooldown=_time_to_cooldown,
                 )  # setting deployment_id in cooldown deployments
 
+                if result and isinstance(exception, litellm.InsufficientQuotaError):
+                    setattr(exception, "_router_quota_cooldown_registered", True)
+
                 return result
             else:
                 verbose_router_logger.debug(
@@ -6968,6 +7002,25 @@ class Router:
 
         except Exception as e:
             raise e
+
+    def _get_cooldown_time_for_exception(self, exception: Exception, deployment_cooldown: Optional[float]) -> float:
+        """Resolve cooldown duration, preserving deployment overrides for quota errors."""
+        if deployment_cooldown is not None and deployment_cooldown >= 0:
+            return deployment_cooldown
+
+        exception_headers = litellm.litellm_core_utils.exception_mapping_utils._get_response_headers(
+            original_exception=exception
+        )
+        header_cooldown = None
+        if exception_headers is not None:
+            header_cooldown = litellm.utils._get_retry_after_from_exception_header(response_headers=exception_headers)
+
+        if header_cooldown is not None and header_cooldown >= 0:
+            if isinstance(exception, litellm.InsufficientQuotaError):
+                return max(self.cooldown_time, header_cooldown)
+            return header_cooldown
+
+        return self.cooldown_time
 
     async def async_deployment_callback_on_failure(
         self, kwargs, completion_response: Optional[Any], start_time, end_time

@@ -172,6 +172,9 @@ def _should_cooldown_deployment(
 
     - v1 logic (Legacy): if allowed fails or allowed fail policy set, coolsdown if num fails in this minute > allowed fails
     """
+    if isinstance(original_exception, litellm.InsufficientQuotaError):
+        return True
+
     ## BASE CASE - single deployment
     model_group = litellm_router_instance.get_model_group(id=deployment)
     is_single_deployment_model_group = False
